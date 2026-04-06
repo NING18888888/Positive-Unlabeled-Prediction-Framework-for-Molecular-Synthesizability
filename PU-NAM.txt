@@ -1,0 +1,533 @@
+import pandas as pd
+import numpy as np
+import warnings
+import os
+warnings.filterwarnings('ignore')
+
+try:
+    from sklearn.base import BaseEstimator, ClassifierMixin
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+    from sklearn.model_selection import KFold
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.utils import class_weight
+    import openpyxl
+except ImportError:
+    print(" 自动安装必要依赖...")
+    import subprocess
+    import sys
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "pandas numpy scikit-learn openpyxl",
+        "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"
+    ])
+    from sklearn.base import BaseEstimator, ClassifierMixin
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+    from sklearn.model_selection import KFold
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.utils import class_weight
+    import openpyxl
+
+
+# =========================================================
+# 0. 全局设置
+# =========================================================
+SEED = 42
+np.random.seed(SEED)
+
+DATA_PATH = r"C:\Users\Lenovo\Desktop\pubchem_fingerprints_sorted2.csv"
+OUTPUT_PATH = None
+LABEL_COL = "label"
+NAME_COL = "mol2_filename"
+FP_DIM = 881
+
+# ========= SPY参数（修正版） =========
+N_SPLITS = 5
+N_BOOTSTRAPS = 20
+FINAL_BOOTSTRAPS = 30
+
+SPY_RATIO = 0.15
+RN_RATIO = 1.5          # 每轮 RN 数量 = 正样本数 * 1.5（只取最低概率那部分）
+THRESH_GRID = np.linspace(0.2, 0.9, 71)
+
+
+# =========================================================
+# 1. 安全输出路径
+# =========================================================
+def get_safe_output_path(default_filename="nam_spy_prediction_fixed.csv"):
+    doc_path = os.path.join(os.path.expanduser("~"), "Documents")
+    return os.path.join(doc_path, default_filename)
+
+
+# =========================================================
+# 2. 数据预处理
+# =========================================================
+def preprocess_data(data_path, label_col=LABEL_COL, mol_name_col=NAME_COL):
+    try:
+        df = pd.read_csv(data_path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(data_path, encoding="gbk")
+
+    required_cols = [mol_name_col, label_col] + [f"fp_{i}" for i in range(FP_DIM)]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"数据缺失必要列：{missing_cols}")
+
+    X = df[[f"fp_{i}" for i in range(FP_DIM)]].values.astype(np.float32)
+    y = df[label_col].values.astype(int)
+    mol_names = df[mol_name_col].values
+
+    X = np.nan_to_num(X, nan=0.0)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    pos_idx = np.where(y == 1)[0]
+    unl_idx = np.where(y == 0)[0]
+
+    print(" 数据预处理完成：")
+    print(f"  - 总样本数：{len(df)}")
+    print(f"  - 正向样本数：{len(pos_idx)}")
+    print(f"  - 未标记样本数：{len(unl_idx)}")
+    print(f"  - 特征维度：{X.shape[1]}（全部分子的 PubChem 指纹 881 位）")
+
+    return df, X_scaled, y, mol_names, pos_idx, unl_idx
+
+
+# =========================================================
+# 3. 修正版 NAM
+#    - 用 MLPClassifier
+#    - 每组输出正类概率
+#    - 所有组取平均，而不是求和
+# =========================================================
+class FeatureGroupNAM(BaseEstimator, ClassifierMixin):
+    def __init__(self, group_size=88, hidden_layer_sizes=(64, 32), random_state=42, max_repeat=4):
+        self.group_size = group_size
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.random_state = random_state
+        self.max_repeat = max_repeat
+        self.subnetworks = []
+        self.n_groups = 0
+
+    def _split_into_groups(self, X):
+        n_features = X.shape[1]
+        self.n_groups = (n_features + self.group_size - 1) // self.group_size
+        feature_groups = []
+        for i in range(self.n_groups):
+            start = i * self.group_size
+            end = min((i + 1) * self.group_size, n_features)
+            feature_groups.append(X[:, start:end])
+        return feature_groups
+
+    def _weight_samples(self, X, y, sample_weight):
+        repeat_counts = np.round(sample_weight).astype(int)
+        repeat_counts[repeat_counts <= 0] = 1
+        repeat_counts = np.clip(repeat_counts, 1, self.max_repeat)
+
+        X_weighted = np.repeat(X, repeat_counts, axis=0)
+        y_weighted = np.repeat(y, repeat_counts, axis=0)
+        return X_weighted, y_weighted
+
+    def fit(self, X, y):
+        feature_groups = self._split_into_groups(X)
+        cw = class_weight.compute_sample_weight('balanced', y)
+
+        self.subnetworks = []
+        for i, group in enumerate(feature_groups):
+            subnet = MLPClassifier(
+                hidden_layer_sizes=self.hidden_layer_sizes,
+                activation='relu',
+                solver='adam',
+                alpha=0.005,
+                batch_size=16,
+                max_iter=300,
+                random_state=self.random_state + i,
+                early_stopping=True,
+                validation_fraction=0.1
+            )
+
+            X_weighted, y_weighted = self._weight_samples(group, y, cw)
+            subnet.fit(X_weighted, y_weighted)
+            self.subnetworks.append(subnet)
+
+        return self
+
+    def predict_group_probas(self, X):
+        feature_groups = self._split_into_groups(X)
+        probas = []
+        for subnet, group in zip(self.subnetworks, feature_groups):
+            p = subnet.predict_proba(group)[:, 1]
+            probas.append(p.reshape(-1, 1))
+        return np.hstack(probas)
+
+    def predict_proba(self, X):
+        group_probas = self.predict_group_probas(X)
+        final_prob = np.mean(group_probas, axis=1)
+        return np.clip(final_prob, 1e-6, 1 - 1e-6)
+
+    def predict(self, X, threshold=0.5):
+        prob = self.predict_proba(X)
+        return (prob >= threshold).astype(int)
+
+
+# =========================================================
+# 4. 阈值搜索
+# =========================================================
+def find_best_threshold(y_true, y_prob, thresholds=THRESH_GRID):
+    best_thr = 0.5
+    best_f1 = -1
+    for thr in thresholds:
+        pred = (y_prob >= thr).astype(int)
+        score = f1_score(y_true, pred, zero_division=0)
+        if score > best_f1:
+            best_f1 = score
+            best_thr = thr
+    return float(best_thr), float(best_f1)
+
+
+# =========================================================
+# 5. 概率再校准
+#    用 P_remain 与 RN 的平均概率重新标尺化
+# =========================================================
+def recalibrate_probability(raw_target, raw_pos_ref, raw_neg_ref):
+    pos_mean = float(np.mean(raw_pos_ref))
+    neg_mean = float(np.mean(raw_neg_ref))
+
+    # 防止分母过小
+    if pos_mean - neg_mean < 1e-6:
+        prob = raw_target.copy()
+    else:
+        prob = (raw_target - neg_mean) / (pos_mean - neg_mean)
+
+    prob = np.clip(prob, 0.0, 1.0)
+    return prob, pos_mean, neg_mean
+
+
+# =========================================================
+# 6. 第一阶段：SPY 识别 RN
+#    更严格：只取未标记样本中最低概率的 bottom-k
+# =========================================================
+def fit_stage1_spy_nam(X_pos, X_unl, seed=SEED):
+    rng = np.random.RandomState(seed)
+
+    n_pos = len(X_pos)
+    n_spy = max(1, int(n_pos * SPY_RATIO))
+    n_spy = min(n_spy, n_pos - 1) if n_pos > 1 else 1
+
+    spy_idx = rng.choice(n_pos, size=n_spy, replace=False)
+    remain_idx = np.setdiff1d(np.arange(n_pos), spy_idx)
+
+    P_spy = X_pos[spy_idx]
+    P_remain = X_pos[remain_idx]
+
+    if len(P_remain) == 0:
+        P_remain = X_pos.copy()
+        P_spy = X_pos[:1].copy()
+
+    U_with_spy = np.vstack([X_unl, P_spy])
+
+    X_stage1 = np.vstack([P_remain, U_with_spy])
+    y_stage1 = np.array([1] * len(P_remain) + [0] * len(U_with_spy))
+
+    model_stage1 = FeatureGroupNAM(
+        group_size=88,
+        hidden_layer_sizes=(64, 32),
+        random_state=seed
+    )
+    model_stage1.fit(X_stage1, y_stage1)
+
+    unl_prob = model_stage1.predict_proba(X_unl)
+
+    rn_k = max(1, int(len(P_remain) * RN_RATIO))
+    rn_k = min(rn_k, len(X_unl))
+
+    order = np.argsort(unl_prob)  # 最低概率优先
+    chosen = order[:rn_k]
+    RN = X_unl[chosen]
+
+    return model_stage1, P_remain, P_spy, RN
+
+
+# =========================================================
+# 7. 第二阶段：P_remain vs RN
+# =========================================================
+def fit_stage2_final_nam(P_remain, RN, seed=SEED):
+    X_stage2 = np.vstack([P_remain, RN])
+    y_stage2 = np.array([1] * len(P_remain) + [0] * len(RN))
+
+    model_stage2 = FeatureGroupNAM(
+        group_size=88,
+        hidden_layer_sizes=(64, 32),
+        random_state=seed + 999
+    )
+    model_stage2.fit(X_stage2, y_stage2)
+
+    return model_stage2
+
+
+# =========================================================
+# 8. 单次 SPY-NAM 训练
+# =========================================================
+def fit_one_spy_nam(X_pos, X_unl, seed=SEED):
+    stage1_model, P_remain, P_spy, RN = fit_stage1_spy_nam(X_pos, X_unl, seed=seed)
+    stage2_model = fit_stage2_final_nam(P_remain, RN, seed=seed + 10000)
+
+    # 记录第二阶段参考分布
+    raw_pos_ref = stage2_model.predict_proba(P_remain)
+    raw_neg_ref = stage2_model.predict_proba(RN)
+
+    return {
+        "stage1_model": stage1_model,
+        "stage2_model": stage2_model,
+        "P_remain": P_remain,
+        "P_spy": P_spy,
+        "RN": RN,
+        "raw_pos_ref": raw_pos_ref,
+        "raw_neg_ref": raw_neg_ref
+    }
+
+
+# =========================================================
+# 9. 主流程
+# =========================================================
+def train_and_evaluate_nam_spy_fixed(data_path, output_path=None):
+    if output_path is None:
+        output_path = get_safe_output_path("nam_spy_prediction_fixed.csv")
+        print(f" 自动使用安全输出路径：{output_path}")
+
+    df, X_all, y_all, mol_names, pos_idx, unl_idx = preprocess_data(data_path)
+
+    X_pos = X_all[pos_idx]
+    X_unl = X_all[unl_idx]
+
+    n_pos = len(X_pos)
+    n_unl = len(X_unl)
+
+    n_splits = min(N_SPLITS, n_pos)
+    if n_splits < 2:
+        raise ValueError("正样本太少，无法进行交叉验证。")
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=SEED)
+
+    pos_oof_prob = np.zeros(n_pos, dtype=float)
+    pos_oof_count = np.zeros(n_pos, dtype=float)
+    unl_fold_prob_list = []
+
+    outer_thresholds = []
+    metrics_records = []
+
+    print("\n 开始修正后的 SPY-NAM 两阶段训练...")
+
+    for fold_id, (train_idx, valid_idx) in enumerate(kf.split(X_pos), start=1):
+        print(f"\n========== Fold {fold_id} ==========")
+
+        Xp_train = X_pos[train_idx]
+        Xp_valid = X_pos[valid_idx]
+
+        prob_pos_valid_sum = np.zeros(len(Xp_valid), dtype=float)
+        prob_unl_all_sum = np.zeros(n_unl, dtype=float)
+
+        rng_eval = np.random.RandomState(SEED + 10000 + fold_id)
+        eval_unl_idx = rng_eval.choice(n_unl, size=len(Xp_valid), replace=False)
+        Xu_eval = X_unl[eval_unl_idx]
+        prob_unl_eval_sum = np.zeros(len(Xu_eval), dtype=float)
+
+        rn_sizes = []
+
+        for b in range(N_BOOTSTRAPS):
+            seed_b = SEED + fold_id * 1000 + b
+
+            result = fit_one_spy_nam(
+                X_pos=Xp_train,
+                X_unl=X_unl,
+                seed=seed_b
+            )
+
+            final_model = result["stage2_model"]
+            raw_pos_ref = result["raw_pos_ref"]
+            raw_neg_ref = result["raw_neg_ref"]
+
+            raw_pos_valid = final_model.predict_proba(Xp_valid)
+            raw_unl_all = final_model.predict_proba(X_unl)
+            raw_u_eval = final_model.predict_proba(Xu_eval)
+
+            prob_pos_valid, _, _ = recalibrate_probability(raw_pos_valid, raw_pos_ref, raw_neg_ref)
+            prob_unl_all, _, _ = recalibrate_probability(raw_unl_all, raw_pos_ref, raw_neg_ref)
+            prob_u_eval, _, _ = recalibrate_probability(raw_u_eval, raw_pos_ref, raw_neg_ref)
+
+            prob_pos_valid_sum += prob_pos_valid
+            prob_unl_all_sum += prob_unl_all
+            prob_unl_eval_sum += prob_u_eval
+
+            rn_sizes.append(len(result["RN"]))
+
+        prob_pos_valid_mean = prob_pos_valid_sum / N_BOOTSTRAPS
+        prob_unl_all_mean = prob_unl_all_sum / N_BOOTSTRAPS
+        prob_unl_eval_mean = prob_unl_eval_sum / N_BOOTSTRAPS
+
+        y_eval = np.array([1] * len(Xp_valid) + [0] * len(Xu_eval))
+        prob_eval = np.concatenate([prob_pos_valid_mean, prob_unl_eval_mean])
+        fold_thr, fold_f1 = find_best_threshold(y_eval, prob_eval)
+
+        outer_thresholds.append(fold_thr)
+
+        pos_oof_prob[valid_idx] += prob_pos_valid_mean
+        pos_oof_count[valid_idx] += 1
+        unl_fold_prob_list.append(prob_unl_all_mean)
+
+        pred_eval = (prob_eval >= fold_thr).astype(int)
+        acc = accuracy_score(y_eval, pred_eval)
+        auc = roc_auc_score(y_eval, prob_eval)
+
+        metrics_records.append({
+            "Fold": fold_id,
+            "Threshold": fold_thr,
+            "F1": fold_f1,
+            "Accuracy": acc,
+            "AUC_ROC": auc,
+            "Pos_mean_probability_1": float(np.mean(prob_pos_valid_mean)),
+            "Unl_mean_probability_1": float(np.mean(prob_unl_eval_mean)),
+            "Mean_RN_size": float(np.mean(rn_sizes))
+        })
+
+        print(f"Fold {fold_id} Threshold: {fold_thr:.3f}")
+        print(f"Fold {fold_id} F1: {fold_f1:.4f}")
+        print(f"Fold {fold_id} Accuracy: {acc:.4f}")
+        print(f"Fold {fold_id} AUC-ROC: {auc:.4f}")
+        print(f"Fold {fold_id} 正样本平均 probability_1: {np.mean(prob_pos_valid_mean):.4f}")
+        print(f"Fold {fold_id} 未标记对照平均 probability_1: {np.mean(prob_unl_eval_mean):.4f}")
+        print(f"Fold {fold_id} 平均 RN 数量: {np.mean(rn_sizes):.2f}")
+
+    pos_prob_oof = pos_oof_prob / np.maximum(pos_oof_count, 1)
+    unl_prob_cv = np.mean(np.vstack(unl_fold_prob_list), axis=0)
+    final_threshold = float(np.mean(outer_thresholds))
+
+    # ========= 最终全数据训练 =========
+    print("\n 开始最终全数据 SPY-NAM 拟合...")
+
+    final_pos_sum = np.zeros(n_pos, dtype=float)
+    final_unl_sum = np.zeros(n_unl, dtype=float)
+    final_rn_sizes = []
+
+    for b in range(FINAL_BOOTSTRAPS):
+        seed_b = SEED + 50000 + b
+
+        result = fit_one_spy_nam(
+            X_pos=X_pos,
+            X_unl=X_unl,
+            seed=seed_b
+        )
+
+        final_model = result["stage2_model"]
+        raw_pos_ref = result["raw_pos_ref"]
+        raw_neg_ref = result["raw_neg_ref"]
+
+        raw_pos = final_model.predict_proba(X_pos)
+        raw_unl = final_model.predict_proba(X_unl)
+
+        prob_pos, _, _ = recalibrate_probability(raw_pos, raw_pos_ref, raw_neg_ref)
+        prob_unl, _, _ = recalibrate_probability(raw_unl, raw_pos_ref, raw_neg_ref)
+
+        final_pos_sum += prob_pos
+        final_unl_sum += prob_unl
+        final_rn_sizes.append(len(result["RN"]))
+
+    final_pos_prob = final_pos_sum / FINAL_BOOTSTRAPS
+    final_unl_prob = final_unl_sum / FINAL_BOOTSTRAPS
+
+    pos_prob_output = 0.7 * pos_prob_oof + 0.3 * final_pos_prob
+    unl_prob_output = 0.5 * unl_prob_cv + 0.5 * final_unl_prob
+
+    pos_prob_output = np.clip(pos_prob_output, 0.0, 1.0)
+    unl_prob_output = np.clip(unl_prob_output, 0.0, 1.0)
+
+    # ========= 拼回总表 =========
+    result_df = df.copy()
+    result_df["positive_prob"] = np.nan
+    result_df["negative_prob"] = np.nan
+
+    result_df.loc[pos_idx, "positive_prob"] = pos_prob_output
+    result_df.loc[pos_idx, "negative_prob"] = 1 - pos_prob_output
+
+    result_df.loc[unl_idx, "positive_prob"] = unl_prob_output
+    result_df.loc[unl_idx, "negative_prob"] = 1 - unl_prob_output
+
+    result_df["predict_label"] = (result_df["positive_prob"] >= final_threshold).astype(int)
+
+    pos_samples = result_df[result_df["label"] == 1].copy().reset_index(drop=True)
+    unlabeled_samples = result_df[result_df["label"] == 0].copy().reset_index(drop=True)
+    pred_0 = result_df[result_df["predict_label"] == 0].copy().reset_index(drop=True)
+    pred_1 = result_df[result_df["predict_label"] == 1].copy().reset_index(drop=True)
+
+    print("\n" + "=" * 70)
+    print(" 修正后 SPY-NAM 概率统计：")
+    print("=" * 70)
+    print(f"  - 最终分类阈值：{final_threshold:.4f}")
+    print(f"  - 真实正向样本：{len(pos_samples)}个 | 平均正类概率：{pos_samples['positive_prob'].mean():.4f}")
+    print(f"  - 真实未标记样本：{len(unlabeled_samples)}个 | 平均正类概率：{unlabeled_samples['positive_prob'].mean():.4f}")
+    print(f"  - 预测为0类样本数：{len(pred_0)}")
+    print(f"  - 预测为1类样本数：{len(pred_1)}")
+
+    # 保存结果
+    try:
+        result_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+        print(f"\n 全量结果保存：{output_path}")
+
+        excel_path = output_path.replace(".csv", "_detailed.xlsx")
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            result_df.to_excel(writer, sheet_name="全部样本", index=False)
+            pos_samples.to_excel(writer, sheet_name="真实正向样本(1)", index=False)
+            unlabeled_samples.to_excel(writer, sheet_name="真实未标记样本(0)", index=False)
+            pred_0.to_excel(writer, sheet_name="预测0类样本", index=False)
+            pred_1.to_excel(writer, sheet_name="预测1类样本", index=False)
+        print(f" 细分结果保存：{excel_path}")
+
+    except PermissionError:
+        fallback_path = os.path.join(os.getcwd(), "nam_spy_prediction_fixed_fallback.csv")
+        result_df.to_csv(fallback_path, index=False, encoding="utf-8-sig")
+        print(f" 目标路径权限不足，已保存到当前工作目录：{fallback_path}")
+
+    metrics_df = pd.DataFrame(metrics_records)
+    mean_row = pd.DataFrame([{
+        "Fold": "Mean",
+        "Threshold": metrics_df["Threshold"].mean(),
+        "F1": metrics_df["F1"].mean(),
+        "Accuracy": metrics_df["Accuracy"].mean(),
+        "AUC_ROC": metrics_df["AUC_ROC"].mean(),
+        "Pos_mean_probability_1": metrics_df["Pos_mean_probability_1"].mean(),
+        "Unl_mean_probability_1": metrics_df["Unl_mean_probability_1"].mean(),
+        "Mean_RN_size": metrics_df["Mean_RN_size"].mean()
+    }])
+    metrics_out = pd.concat([metrics_df, mean_row], ignore_index=True)
+
+    metrics_path = output_path.replace(".csv", "_metrics.csv")
+    metrics_out.to_csv(metrics_path, index=False, encoding="utf-8-sig")
+    print(f" 指标结果保存：{metrics_path}")
+
+    print("\n" + "=" * 70)
+    print(" 修正后 SPY-NAM 评价")
+    print("=" * 70)
+    print(f"  - Mean F1-score：{metrics_df['F1'].mean():.4f}")
+    print(f"  - Mean Accuracy：{metrics_df['Accuracy'].mean():.4f}")
+    print(f"  - Mean AUC-ROC：{metrics_df['AUC_ROC'].mean():.4f}")
+    print(f"  - Mean Threshold：{metrics_df['Threshold'].mean():.4f}")
+    print(f"  - 最终训练平均 RN 数量：{np.mean(final_rn_sizes):.2f}")
+
+    return result_df, metrics_out, pos_samples, unlabeled_samples
+
+
+# =========================================================
+# 10. 主入口
+# =========================================================
+if __name__ == "__main__":
+    try:
+        result_df, metrics_df, pos_samples, unlabeled_samples = train_and_evaluate_nam_spy_fixed(
+            data_path=DATA_PATH,
+            output_path=OUTPUT_PATH
+        )
+        print("\n 修正后的 SPY-NAM 模型运行完成！")
+    except Exception as e:
+        print(f"\n 运行出错：{str(e)}")
+        import traceback
+        traceback.print_exc()

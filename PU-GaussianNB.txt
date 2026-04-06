@@ -1,0 +1,374 @@
+import pandas as pd
+import numpy as np
+import random
+import time
+from collections import Counter
+
+from sklearn.model_selection import KFold
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+from sklearn.naive_bayes import GaussianNB
+
+# =========================
+# 基础设置
+# =========================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 1000)
+pd.set_option('display.float_format', lambda x: '%.6f' % x)
+
+# =========================
+# 文件路径
+# =========================
+DATA_PATH = r'C:\Users\Lenovo\Desktop\模型整理后运行-01\PRHZ52.CSV'
+OUTPUT_PATH = r'C:\Users\Lenovo\Desktop\PU_GNB_SPY.csv'
+METRICS_PATH = r'C:\Users\Lenovo\Desktop\PU_GNB_SPY_metrics.csv'
+
+# =========================
+# 参数
+# =========================
+N_SPLITS = 5
+N_BOOTSTRAPS = 100
+FINAL_BOOTSTRAPS = 200
+SPY_RATIO = 0.15              # 训练正样本中拿多少比例做 spy
+SPY_QUANTILE = 0.15           # 用 spy 概率分位数作为阈值
+MIN_RN_RATIO = 1.0            # RN 至少达到 正样本数 * 该比例
+MAX_RN_RATIO = 5.0            # RN 最多不超过 正样本数 * 该比例
+THRESHOLD = 0.5               # 最终评价阈值
+
+# =========================
+# 数据读取
+# 标签列逻辑沿用原始代码：
+# col_label = 总列数 - 52
+# =========================
+def load_pu_data(path):
+    texts = pd.read_csv(path, header=None)
+    col_label = texts.shape[1] - 52
+
+    labels = dict(Counter(texts[col_label]))
+    sorted_labels = sorted(labels.items(), key=lambda x: x[1], reverse=True)
+
+    if len(sorted_labels) < 2:
+        raise ValueError("数据类别不足，无法建模。")
+
+    label_0 = sorted_labels[0][0]   # 数量最多 -> 未标记类
+    label_1 = sorted_labels[1][0]   # 数量第二多 -> 正类
+
+    print("原始标签统计：", labels)
+    print("样本数量最多的类别（视为未标记 U）：", label_0, "其数量为：", sorted_labels[0][1])
+    print("样本数量第二多的类别（视为正类 P）：", label_1, "其数量为：", sorted_labels[1][1])
+
+    index_1 = [i for i, c in enumerate(texts[col_label]) if c == label_1]
+    index_0 = [i for i, c in enumerate(texts[col_label]) if c == label_0]
+
+    texts_1 = texts.iloc[index_1].drop([col_label], axis=1).to_numpy(dtype=float)
+    texts_0 = texts.iloc[index_0].drop([col_label], axis=1).to_numpy(dtype=float)
+
+    return texts_1, texts_0
+
+
+# =========================
+# 安全取 probability_1
+# =========================
+def get_probability_1(model, X):
+    X = np.array(X)
+    proba = model.predict_proba(X)
+    proba = np.asarray(proba)
+
+    if proba.ndim == 2 and proba.shape[1] >= 2:
+        classes = getattr(model, 'classes_', np.array([0, 1]))
+        if 1 in classes:
+            idx1 = int(np.where(classes == 1)[0][0])
+            return np.clip(proba[:, idx1].astype(float), 0.0, 1.0)
+        return np.zeros(len(X), dtype=float)
+
+    if proba.ndim == 2 and proba.shape[1] == 1:
+        classes = getattr(model, 'classes_', np.array([0]))
+        sole_class = classes[0]
+        if sole_class == 1:
+            return np.ones(len(X), dtype=float)
+        return np.zeros(len(X), dtype=float)
+
+    if proba.ndim == 1:
+        return np.clip(proba.astype(float), 0.0, 1.0)
+
+    raise ValueError(f"无法识别 predict_proba 输出形状: {proba.shape}")
+
+
+# =========================
+# 单次 GNB-SPY 训练
+# 返回：
+# - 最终二阶段模型
+# - RN 样本数
+# - spy阈值
+# =========================
+def fit_one_gnb_spy(X_pos, X_unl, seed=42):
+    rng = np.random.RandomState(seed)
+
+    n_pos = len(X_pos)
+    n_spy = max(1, int(n_pos * SPY_RATIO))
+    n_spy = min(n_spy, n_pos - 1) if n_pos > 1 else 1
+
+    # 1. 从正样本中抽出 spy
+    spy_idx = rng.choice(n_pos, size=n_spy, replace=False)
+    remain_idx = np.setdiff1d(np.arange(n_pos), spy_idx)
+
+    P_spy = X_pos[spy_idx]
+    P_remain = X_pos[remain_idx]
+
+    # 防止极端情况
+    if len(P_remain) == 0:
+        P_remain = X_pos.copy()
+        P_spy = X_pos[:1].copy()
+
+    # 2. 第一阶段：P_remain vs (U + Spy)
+    U_with_spy = np.vstack([X_unl, P_spy])
+
+    X_stage1 = np.vstack([P_remain, U_with_spy])
+    y_stage1 = np.array([1] * len(P_remain) + [0] * len(U_with_spy))
+
+    model_stage1 = GaussianNB()
+    model_stage1.fit(X_stage1, y_stage1)
+
+    # 3. 计算 spy 概率与 U 概率
+    spy_prob = get_probability_1(model_stage1, P_spy)
+    unl_prob = get_probability_1(model_stage1, X_unl)
+
+    # 4. 通过 spy 分布确定阈值
+    # Spy本质是真正正类，但被混进U中。
+    # 若某个U样本的正类概率比大部分spy还低，则更可能是可靠负类
+    threshold_spy = np.quantile(spy_prob, SPY_QUANTILE)
+
+    rn_mask = unl_prob < threshold_spy
+    RN = X_unl[rn_mask]
+
+    # 5. 若 RN 太少，则退而求其次：按未标记概率从低到高选一批
+    min_rn = max(1, int(len(P_remain) * MIN_RN_RATIO))
+    max_rn = max(min_rn, int(len(P_remain) * MAX_RN_RATIO))
+
+    if len(RN) < min_rn:
+        order = np.argsort(unl_prob)  # 从最像负类的开始
+        chosen = order[:min(min_rn, len(X_unl))]
+        RN = X_unl[chosen]
+
+    if len(RN) > max_rn:
+        rn_prob = get_probability_1(model_stage1, RN)
+        order = np.argsort(rn_prob)
+        RN = RN[order[:max_rn]]
+
+    # 6. 第二阶段：P_remain vs RN
+    X_stage2 = np.vstack([P_remain, RN])
+    y_stage2 = np.array([1] * len(P_remain) + [0] * len(RN))
+
+    model_stage2 = GaussianNB()
+    model_stage2.fit(X_stage2, y_stage2)
+
+    return model_stage2, len(RN), float(threshold_spy)
+
+
+# =========================
+# 主程序
+# =========================
+def main():
+    start = time.time()
+
+    texts_1, texts_0 = load_pu_data(DATA_PATH)
+
+    n_pos = len(texts_1)
+    n_unl = len(texts_0)
+
+    print(f"\n正样本数 P = {n_pos}")
+    print(f"未标记样本数 U = {n_unl}")
+
+    n_splits = min(N_SPLITS, n_pos)
+    if n_splits < 2:
+        raise ValueError("正样本太少，无法交叉验证。")
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=SEED)
+
+    # 正样本 OOF 概率
+    pos_oof_prob_1 = np.zeros(n_pos)
+    pos_oof_count = np.zeros(n_pos)
+
+    # 未标记样本每折概率
+    unl_fold_probs = []
+
+    # 指标
+    metrics_records = []
+
+    for fold_id, (train_idx, valid_idx) in enumerate(kf.split(texts_1), start=1):
+        print(f"\n========== Fold {fold_id} ==========")
+
+        p_train = texts_1[train_idx]
+        p_valid = texts_1[valid_idx]
+
+        prob_pos_valid_sum = np.zeros(len(p_valid))
+        prob_unl_all_sum = np.zeros(n_unl)
+
+        rng_eval = np.random.RandomState(SEED + 10000 + fold_id)
+        eval_unl_idx = rng_eval.choice(n_unl, size=len(p_valid), replace=False)
+        u_eval = texts_0[eval_unl_idx]
+        prob_u_eval_sum = np.zeros(len(u_eval))
+
+        rn_size_list = []
+        spy_thr_list = []
+
+        for b in range(N_BOOTSTRAPS):
+            seed_b = SEED + fold_id * 1000 + b
+
+            model, rn_size, spy_thr = fit_one_gnb_spy(
+                X_pos=p_train,
+                X_unl=texts_0,
+                seed=seed_b
+            )
+
+            prob_pos_valid_sum += get_probability_1(model, p_valid)
+            prob_unl_all_sum += get_probability_1(model, texts_0)
+            prob_u_eval_sum += get_probability_1(model, u_eval)
+
+            rn_size_list.append(rn_size)
+            spy_thr_list.append(spy_thr)
+
+        prob_pos_valid_mean = prob_pos_valid_sum / N_BOOTSTRAPS
+        prob_unl_all_mean = prob_unl_all_sum / N_BOOTSTRAPS
+        prob_u_eval_mean = prob_u_eval_sum / N_BOOTSTRAPS
+
+        pos_oof_prob_1[valid_idx] += prob_pos_valid_mean
+        pos_oof_count[valid_idx] += 1
+        unl_fold_probs.append(prob_unl_all_mean)
+
+        y_eval = np.array([1] * len(p_valid) + [0] * len(u_eval))
+        prob_eval = np.concatenate([prob_pos_valid_mean, prob_u_eval_mean])
+        pred_eval = (prob_eval >= THRESHOLD).astype(int)
+
+        f1 = f1_score(y_eval, pred_eval)
+        acc = accuracy_score(y_eval, pred_eval)
+        auc = roc_auc_score(y_eval, prob_eval)
+
+        metrics_records.append({
+            'Fold': fold_id,
+            'F1': f1,
+            'Accuracy': acc,
+            'AUC_ROC': auc,
+            'Pos_mean_probability_1': float(np.mean(prob_pos_valid_mean)),
+            'Unl_mean_probability_1': float(np.mean(prob_u_eval_mean)),
+            'Mean_RN_size': float(np.mean(rn_size_list)),
+            'Mean_spy_threshold': float(np.mean(spy_thr_list))
+        })
+
+        print(f"Fold {fold_id} F1: {f1:.6f}")
+        print(f"Fold {fold_id} Accuracy: {acc:.6f}")
+        print(f"Fold {fold_id} AUC-ROC: {auc:.6f}")
+        print(f"Fold {fold_id} 正样本平均 probability_1: {np.mean(prob_pos_valid_mean):.6f}")
+        print(f"Fold {fold_id} 未标记对照平均 probability_1: {np.mean(prob_u_eval_mean):.6f}")
+        print(f"Fold {fold_id} 平均 RN 数量: {np.mean(rn_size_list):.2f}")
+        print(f"Fold {fold_id} 平均 spy 阈值: {np.mean(spy_thr_list):.6f}")
+
+    # 正样本 OOF 均值
+    pos_prob_oof_1 = pos_oof_prob_1 / np.maximum(pos_oof_count, 1)
+
+    # 未标记样本 CV 均值
+    unl_prob_cv_1 = np.mean(np.vstack(unl_fold_probs), axis=0)
+
+    # =========================
+    # 最终全数据训练
+    # =========================
+    print("\n========== Final Training ==========")
+
+    final_pos_sum = np.zeros(n_pos)
+    final_unl_sum = np.zeros(n_unl)
+    final_rn_size_list = []
+    final_spy_thr_list = []
+
+    for b in range(FINAL_BOOTSTRAPS):
+        seed_b = SEED + 50000 + b
+
+        model, rn_size, spy_thr = fit_one_gnb_spy(
+            X_pos=texts_1,
+            X_unl=texts_0,
+            seed=seed_b
+        )
+
+        final_pos_sum += get_probability_1(model, texts_1)
+        final_unl_sum += get_probability_1(model, texts_0)
+
+        final_rn_size_list.append(rn_size)
+        final_spy_thr_list.append(spy_thr)
+
+    final_pos_prob_1 = final_pos_sum / FINAL_BOOTSTRAPS
+    final_unl_prob_1 = final_unl_sum / FINAL_BOOTSTRAPS
+
+    # 融合
+    pos_prob_output_1 = 0.7 * pos_prob_oof_1 + 0.3 * final_pos_prob_1
+    unl_prob_output_1 = 0.5 * unl_prob_cv_1 + 0.5 * final_unl_prob_1
+
+    pos_prob_output_1 = np.clip(pos_prob_output_1, 0.0, 1.0)
+    unl_prob_output_1 = np.clip(unl_prob_output_1, 0.0, 1.0)
+
+    pos_prob_output_0 = 1.0 - pos_prob_output_1
+    unl_prob_output_0 = 1.0 - unl_prob_output_1
+
+    # =========================
+    # 输出总表
+    # =========================
+    df_pos_out = pd.DataFrame(texts_1)
+    df_pos_out['sample_type'] = 'positive_1'
+    df_pos_out['probability_0'] = pos_prob_output_0
+    df_pos_out['probability_1'] = pos_prob_output_1
+
+    df_unl_out = pd.DataFrame(texts_0)
+    df_unl_out['sample_type'] = 'unlabeled_0'
+    df_unl_out['probability_0'] = unl_prob_output_0
+    df_unl_out['probability_1'] = unl_prob_output_1
+
+    df_out = pd.concat([df_pos_out, df_unl_out], axis=0, ignore_index=True)
+
+    cols = list(df_out.columns)
+    fixed_cols = [c for c in cols if c not in ['probability_0', 'probability_1']]
+    df_out = df_out[fixed_cols + ['probability_0', 'probability_1']]
+
+    df_out.to_csv(OUTPUT_PATH, index=False, encoding='utf-8-sig')
+
+    # =========================
+    # 输出指标
+    # =========================
+    metrics_df = pd.DataFrame(metrics_records)
+    mean_row = pd.DataFrame([{
+        'Fold': 'Mean',
+        'F1': metrics_df['F1'].mean(),
+        'Accuracy': metrics_df['Accuracy'].mean(),
+        'AUC_ROC': metrics_df['AUC_ROC'].mean(),
+        'Pos_mean_probability_1': metrics_df['Pos_mean_probability_1'].mean(),
+        'Unl_mean_probability_1': metrics_df['Unl_mean_probability_1'].mean(),
+        'Mean_RN_size': metrics_df['Mean_RN_size'].mean(),
+        'Mean_spy_threshold': metrics_df['Mean_spy_threshold'].mean()
+    }])
+    metrics_out = pd.concat([metrics_df, mean_row], ignore_index=True)
+    metrics_out.to_csv(METRICS_PATH, index=False, encoding='utf-8-sig')
+
+    # =========================
+    # 最终打印
+    # =========================
+    print("\n========== 最终结果 ==========")
+    print("全部分子分类概率文件已保存：", OUTPUT_PATH)
+    print("交叉验证指标文件已保存：", METRICS_PATH)
+
+    print("\n正样本 probability_1 统计：")
+    print(pd.Series(pos_prob_output_1).describe())
+
+    print("\n未标记样本 probability_1 统计：")
+    print(pd.Series(unl_prob_output_1).describe())
+
+    print("\n正样本平均 probability_1：", float(np.mean(pos_prob_output_1)))
+    print("未标记样本平均 probability_1：", float(np.mean(unl_prob_output_1)))
+    print("最终训练平均 RN 数量：", float(np.mean(final_rn_size_list)))
+    print("最终训练平均 spy 阈值：", float(np.mean(final_spy_thr_list)))
+
+    print("\n运行总耗时：%.2f 秒" % (time.time() - start))
+
+
+if __name__ == '__main__':
+    main()
