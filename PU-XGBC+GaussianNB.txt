@@ -10,9 +10,6 @@ from sklearn.naive_bayes import GaussianNB
 from xgboost import XGBClassifier
 from pu_learning import spies
 
-# =========================
-# 基础设置
-# =========================
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -22,26 +19,17 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 1000)
 pd.set_option('display.float_format', lambda x: '%.6f' % x)
 
-# =========================
-# 文件路径
-# =========================
-DATA_PATH = r'C:\Users\Lenovo\Desktop\模型整理后运行-01\PRHZ52.CSV'
+DATA_PATH = r'C:\Users\Lenovo\Desktop\PRHZ52.CSV'
 OUTPUT_PATH = r'C:\Users\Lenovo\Desktop\PU_XGBC_GNB_swapped.csv'
 METRICS_PATH = r'C:\Users\Lenovo\Desktop\PU_cv_metrics_swapped.csv'
 
-# =========================
-# 参数
-# =========================
 N_SPLITS = 5
 N_BOOTSTRAPS = 80
 FINAL_BOOTSTRAPS = 150
 UNL_TO_POS_RATIO = 2
 THRESHOLD = 0.5
-MAX_RETRY_PER_BOOTSTRAP = 30   # 每轮最多重试次数，避免 second_model 单类塌缩
+MAX_RETRY_PER_BOOTSTRAP = 30 
 
-# =========================
-# 数据读取
-# =========================
 def load_data(path):
     texts = pd.read_csv(path, header=None)
     col_label = texts.shape[1] - 52
@@ -49,15 +37,8 @@ def load_data(path):
     labels = dict(Counter(texts[col_label]))
     sorted_labels = sorted(labels.items(), key=lambda x: x[1], reverse=True)
 
-    if len(sorted_labels) < 2:
-        raise ValueError("数据类别不足，无法建模。")
-
-    label_0 = sorted_labels[0][0]   # 数量最多 -> 未标记类
-    label_1 = sorted_labels[1][0]   # 数量第二多 -> 正类
-
-    print("原始标签统计：", labels)
-    print("样本数量最多的类别（视为未标记 U）：", label_0, "其数量为：", sorted_labels[0][1])
-    print("样本数量第二多的类别（视为正类 P）：", label_1, "其数量为：", sorted_labels[1][1])
+    label_0 = sorted_labels[0][0]   
+    label_1 = sorted_labels[1][0]   
 
     index_1 = [i for i, c in enumerate(texts[col_label]) if c == label_1]
     index_0 = [i for i, c in enumerate(texts[col_label]) if c == label_0]
@@ -67,10 +48,6 @@ def load_data(path):
 
     return texts_1, texts_0
 
-
-# =========================
-# 构建 spies 模型
-# 保留你对调后的顺序：
 # spies(XGBClassifier, GaussianNB)
 # =========================
 def build_spies_model(seed=42):
@@ -94,33 +71,21 @@ def build_spies_model(seed=42):
     )
     return model
 
-
-# =========================
-# 安全读取 second_model 的概率
-# 不直接用 model.predict_proba()，因为 pu_learning.py 内部写死了 [:,1]
-# =========================
 def safe_second_model_proba(model, X):
     X = np.array(X)
-
-    if not hasattr(model, 'second_model'):
-        raise AttributeError("spies 模型没有 second_model 属性，无法安全读取概率。")
 
     sm = model.second_model
     proba = sm.predict_proba(X)
     proba = np.asarray(proba)
 
-    # 标准二分类，两列
     if proba.ndim == 2 and proba.shape[1] >= 2:
         classes = getattr(sm, 'classes_', np.array([0, 1]))
-        # 找到“1类”所在列
         if 1 in classes:
             idx1 = int(np.where(classes == 1)[0][0])
             return proba[:, idx1].astype(float)
         else:
-            # 没有1类，只能视为全0
             return np.zeros(X.shape[0], dtype=float)
 
-    # 单列：说明 second_model 只见到了一个类别
     if proba.ndim == 2 and proba.shape[1] == 1:
         classes = getattr(sm, 'classes_', np.array([0]))
         sole_class = classes[0]
@@ -129,17 +94,9 @@ def safe_second_model_proba(model, X):
         else:
             return np.zeros(X.shape[0], dtype=float)
 
-    # 一维少见情况
     if proba.ndim == 1:
         return np.clip(proba.astype(float), 0.0, 1.0)
 
-    raise ValueError(f"无法识别 second_model.predict_proba 输出形状: {proba.shape}")
-
-
-# =========================
-# 自动校正概率方向
-# 若训练正样本均值 < 当前未标记训练子集均值，则取反
-# =========================
 def corrected_prob_1(model, X_target, X_pos_ref, X_unl_ref):
     raw_pos = safe_second_model_proba(model, X_pos_ref)
     raw_unl = safe_second_model_proba(model, X_unl_ref)
@@ -152,10 +109,6 @@ def corrected_prob_1(model, X_target, X_pos_ref, X_unl_ref):
 
     return prob_1, reverse_flag, float(np.mean(raw_pos)), float(np.mean(raw_unl))
 
-
-# =========================
-# 判断 second_model 是否是有效二分类
-# =========================
 def second_model_is_valid(model):
     if not hasattr(model, 'second_model'):
         return False
@@ -167,11 +120,6 @@ def second_model_is_valid(model):
 
     return len(classes) >= 2
 
-
-# =========================
-# 一次平衡训练
-# 如果 second_model 单类塌缩，则重试
-# =========================
 def fit_one_balanced_spies(X_pos_train, X_unl_pool, seed):
     n_pos = len(X_pos_train)
 
@@ -191,15 +139,6 @@ def fit_one_balanced_spies(X_pos_train, X_unl_pool, seed):
         if second_model_is_valid(model):
             return model, X_unl_sample, retry
 
-    raise RuntimeError(
-        f"连续 {MAX_RETRY_PER_BOOTSTRAP} 次训练后 second_model 仍然只有一个类别，"
-        f"当前 swapped 顺序的 spies 结构不稳定。"
-    )
-
-
-# =========================
-# 主程序
-# =========================
 def main():
     start = time.time()
 
@@ -208,12 +147,7 @@ def main():
     n_pos = len(texts_1)
     n_unl = len(texts_0)
 
-    print(f"\n正样本数 P = {n_pos}")
-    print(f"未标记样本数 U = {n_unl}")
-
     n_splits = min(N_SPLITS, n_pos)
-    if n_splits < 2:
-        raise ValueError("正样本太少，无法交叉验证。")
 
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=SEED)
 
@@ -294,17 +228,10 @@ def main():
         print(f"Fold {fold_id} F1: {f1:.6f}")
         print(f"Fold {fold_id} Accuracy: {acc:.6f}")
         print(f"Fold {fold_id} AUC-ROC: {auc:.6f}")
-        print(f"Fold {fold_id} 正样本平均 probability_1: {np.mean(prob_pos_valid_mean):.6f}")
-        print(f"Fold {fold_id} 未标记对照平均 probability_1: {np.mean(prob_u_eval_mean):.6f}")
-        print(f"Fold {fold_id} 概率方向被反转的比例: {np.mean(reverse_flags):.3f}")
-        print(f"Fold {fold_id} 平均重试次数: {np.mean(retry_used_list):.3f}")
 
     pos_prob_oof_1 = pos_oof_prob_1 / np.maximum(pos_oof_count, 1)
     unl_prob_cv_1 = np.mean(np.vstack(unl_fold_probs), axis=0)
 
-    # =========================
-    # 最终全数据训练
-    # =========================
     print("\n========== Final Training ==========")
 
     final_pos_sum = np.zeros(n_pos)
@@ -336,7 +263,6 @@ def main():
     final_pos_prob_1 = final_pos_sum / FINAL_BOOTSTRAPS
     final_unl_prob_1 = final_unl_sum / FINAL_BOOTSTRAPS
 
-    # 融合
     pos_prob_output_1 = 0.7 * pos_prob_oof_1 + 0.3 * final_pos_prob_1
     unl_prob_output_1 = 0.5 * unl_prob_cv_1 + 0.5 * final_unl_prob_1
 
@@ -346,9 +272,6 @@ def main():
     pos_prob_output_0 = 1.0 - pos_prob_output_1
     unl_prob_output_0 = 1.0 - unl_prob_output_1
 
-    # =========================
-    # 输出总表
-    # =========================
     df_pos_out = pd.DataFrame(texts_1)
     df_pos_out['sample_type'] = 'positive_1'
     df_pos_out['probability_0'] = pos_prob_output_0
@@ -367,9 +290,6 @@ def main():
 
     df_out.to_csv(OUTPUT_PATH, index=False, encoding='utf-8-sig')
 
-    # =========================
-    # 输出指标
-    # =========================
     metrics_df = pd.DataFrame(metrics_records)
     mean_row = pd.DataFrame([{
         'Fold': 'Mean',
@@ -383,27 +303,6 @@ def main():
     }])
     metrics_out = pd.concat([metrics_df, mean_row], ignore_index=True)
     metrics_out.to_csv(METRICS_PATH, index=False, encoding='utf-8-sig')
-
-    # =========================
-    # 最终打印
-    # =========================
-    print("\n========== 最终结果 ==========")
-    print("全部分子分类概率文件已保存：", OUTPUT_PATH)
-    print("交叉验证指标文件已保存：", METRICS_PATH)
-
-    print("\n正样本 probability_1 统计：")
-    print(pd.Series(pos_prob_output_1).describe())
-
-    print("\n未标记样本 probability_1 统计：")
-    print(pd.Series(unl_prob_output_1).describe())
-
-    print("\n正样本平均 probability_1：", float(np.mean(pos_prob_output_1)))
-    print("未标记样本平均 probability_1：", float(np.mean(unl_prob_output_1)))
-    print("最终训练阶段概率方向被反转的比例：", float(np.mean(final_reverse_flags)))
-    print("最终训练阶段平均重试次数：", float(np.mean(final_retry_list)))
-
-    print("\n运行总耗时：%.2f 秒" % (time.time() - start))
-
 
 if __name__ == '__main__':
     main()
