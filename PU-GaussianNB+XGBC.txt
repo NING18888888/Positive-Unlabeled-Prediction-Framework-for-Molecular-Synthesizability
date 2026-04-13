@@ -10,9 +10,6 @@ from sklearn.naive_bayes import GaussianNB
 from xgboost import XGBClassifier
 from pu_learning import spies
 
-# =========================
-# 基础设置
-# =========================
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -22,27 +19,18 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 1000)
 pd.set_option('display.float_format', lambda x: '%.6f' % x)
 
-# =========================
-# 文件路径
-# =========================
-DATA_PATH = r'C:\Users\Lenovo\Desktop\模型整理后运行-01\PRHZ52.CSV'
+
+DATA_PATH = r'C:\Users\Lenovo\Desktop\PRHZ52.CSV'
 OUTPUT_PATH = r'C:\Users\Lenovo\Desktop\PU_XGBC.csv'
 METRICS_PATH = r'C:\Users\Lenovo\Desktop\PU_cv_metrics.csv'
 
-# =========================
-# 参数
-# =========================
 N_SPLITS = 5
-N_BOOTSTRAPS = 80          # 每折重复训练次数
-FINAL_BOOTSTRAPS = 150     # 最终全数据训练次数
-UNL_TO_POS_RATIO = 2       # 每次训练时，抽取未标记样本数 = 正样本数 * 2
+N_BOOTSTRAPS = 80          
+FINAL_BOOTSTRAPS = 150    
+UNL_TO_POS_RATIO = 2      
 THRESHOLD = 0.5
 
-# =========================
-# 数据读取
-# 仍沿用你原代码：
-# col_label = 总列数 - 52
-# =========================
+
 def load_data(path):
     texts = pd.read_csv(path, header=None)
     col_label = texts.shape[1] - 52
@@ -50,15 +38,10 @@ def load_data(path):
     labels = dict(Counter(texts[col_label]))
     sorted_labels = sorted(labels.items(), key=lambda x: x[1], reverse=True)
 
-    if len(sorted_labels) < 2:
-        raise ValueError("数据类别不足，无法建模。")
 
-    label_0 = sorted_labels[0][0]   # 数量最多 -> 未标记类
-    label_1 = sorted_labels[1][0]   # 数量第二多 -> 正类
+    label_0 = sorted_labels[0][0]   
+    label_1 = sorted_labels[1][0]   
 
-    print("原始标签统计：", labels)
-    print("样本数量最多的类别（视为未标记 U）：", label_0, "其数量为：", sorted_labels[0][1])
-    print("样本数量第二多的类别（视为正类 P）：", label_1, "其数量为：", sorted_labels[1][1])
 
     index_1 = [i for i, c in enumerate(texts[col_label]) if c == label_1]
     index_0 = [i for i, c in enumerate(texts[col_label]) if c == label_0]
@@ -69,9 +52,6 @@ def load_data(path):
     return texts_1, texts_0
 
 
-# =========================
-# 构建 spies 模型
-# =========================
 def build_spies_model(seed=42):
     model = spies(
         GaussianNB(),
@@ -94,10 +74,6 @@ def build_spies_model(seed=42):
     return model
 
 
-# =========================
-# 安全读取概率
-# 兼容 spies.predict_proba 的不同输出形式
-# =========================
 def get_raw_proba(model, X):
     proba = model.predict_proba(X)
     proba = np.asarray(proba)
@@ -111,13 +87,6 @@ def get_raw_proba(model, X):
     if proba.ndim == 2 and proba.shape[1] == 1:
         return proba.ravel().astype(float)
 
-    raise ValueError(f"无法识别 predict_proba 输出形状: {proba.shape}")
-
-
-# =========================
-# 自动校正概率方向
-# 若训练正样本均值 < 当前未标记训练子集均值，则取反
-# =========================
 def corrected_prob_1(model, X_target, X_pos_ref, X_unl_ref):
     raw_pos = get_raw_proba(model, X_pos_ref)
     raw_unl = get_raw_proba(model, X_unl_ref)
@@ -130,11 +99,6 @@ def corrected_prob_1(model, X_target, X_pos_ref, X_unl_ref):
 
     return prob_1, reverse_flag, float(np.mean(raw_pos)), float(np.mean(raw_unl))
 
-
-# =========================
-# 一次平衡训练
-# 仍用 spies，但不把全部472个未标记样本一次性塞进去
-# =========================
 def fit_one_balanced_spies(X_pos_train, X_unl_pool, seed):
     rng = np.random.RandomState(seed)
 
@@ -152,10 +116,6 @@ def fit_one_balanced_spies(X_pos_train, X_unl_pool, seed):
 
     return model, X_unl_sample
 
-
-# =========================
-# 主程序
-# =========================
 def main():
     start = time.time()
 
@@ -164,23 +124,15 @@ def main():
     n_pos = len(texts_1)
     n_unl = len(texts_0)
 
-    print(f"\n正样本数 P = {n_pos}")
-    print(f"未标记样本数 U = {n_unl}")
-
     n_splits = min(N_SPLITS, n_pos)
-    if n_splits < 2:
-        raise ValueError("正样本太少，无法交叉验证。")
 
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=SEED)
 
-    # 正样本折外概率
     pos_oof_prob_1 = np.zeros(n_pos)
     pos_oof_count = np.zeros(n_pos)
 
-    # 未标记样本每折概率
     unl_fold_probs = []
 
-    # 评价指标
     metrics_records = []
 
     for fold_id, (train_idx, valid_idx) in enumerate(kf.split(texts_1), start=1):
@@ -189,11 +141,9 @@ def main():
         p_train = texts_1[train_idx]
         p_valid = texts_1[valid_idx]
 
-        # 当前折累积概率
         prob_pos_valid_sum = np.zeros(len(p_valid))
         prob_unl_all_sum = np.zeros(n_unl)
 
-        # 为评价而抽取等量未标记对照
         rng_eval = np.random.RandomState(SEED + 10000 + fold_id)
         eval_unl_idx = rng_eval.choice(n_unl, size=len(p_valid), replace=False)
         u_eval = texts_0[eval_unl_idx]
@@ -233,7 +183,6 @@ def main():
         pos_oof_count[valid_idx] += 1
         unl_fold_probs.append(prob_unl_all_mean)
 
-        # 当前折评价
         y_eval = np.array([1] * len(p_valid) + [0] * len(u_eval))
         prob_eval = np.concatenate([prob_pos_valid_mean, prob_u_eval_mean])
         pred_eval = (prob_eval >= THRESHOLD).astype(int)
@@ -255,19 +204,11 @@ def main():
         print(f"Fold {fold_id} F1: {f1:.6f}")
         print(f"Fold {fold_id} Accuracy: {acc:.6f}")
         print(f"Fold {fold_id} AUC-ROC: {auc:.6f}")
-        print(f"Fold {fold_id} 正样本平均 probability_1: {np.mean(prob_pos_valid_mean):.6f}")
-        print(f"Fold {fold_id} 未标记对照平均 probability_1: {np.mean(prob_u_eval_mean):.6f}")
-        print(f"Fold {fold_id} 概率方向被反转的比例: {np.mean(reverse_flags):.3f}")
 
-    # 正样本折外均值
     pos_prob_oof_1 = pos_oof_prob_1 / np.maximum(pos_oof_count, 1)
 
-    # 未标记样本交叉验证均值
     unl_prob_cv_1 = np.mean(np.vstack(unl_fold_probs), axis=0)
 
-    # =========================
-    # 最终全数据训练
-    # =========================
     print("\n========== Final Training ==========")
 
     final_pos_sum = np.zeros(n_pos)
@@ -297,7 +238,6 @@ def main():
     final_pos_prob_1 = final_pos_sum / FINAL_BOOTSTRAPS
     final_unl_prob_1 = final_unl_sum / FINAL_BOOTSTRAPS
 
-    # 融合
     pos_prob_output_1 = 0.7 * pos_prob_oof_1 + 0.3 * final_pos_prob_1
     unl_prob_output_1 = 0.5 * unl_prob_cv_1 + 0.5 * final_unl_prob_1
 
@@ -307,9 +247,6 @@ def main():
     pos_prob_output_0 = 1.0 - pos_prob_output_1
     unl_prob_output_0 = 1.0 - unl_prob_output_1
 
-    # =========================
-    # 输出总表
-    # =========================
     df_pos_out = pd.DataFrame(texts_1)
     df_pos_out['sample_type'] = 'positive_1'
     df_pos_out['probability_0'] = pos_prob_output_0
@@ -328,9 +265,6 @@ def main():
 
     df_out.to_csv(OUTPUT_PATH, index=False, encoding='utf-8-sig')
 
-    # =========================
-    # 输出指标
-    # =========================
     metrics_df = pd.DataFrame(metrics_records)
     mean_row = pd.DataFrame([{
         'Fold': 'Mean',
@@ -343,26 +277,6 @@ def main():
     }])
     metrics_out = pd.concat([metrics_df, mean_row], ignore_index=True)
     metrics_out.to_csv(METRICS_PATH, index=False, encoding='utf-8-sig')
-
-    # =========================
-    # 最终打印
-    # =========================
-    print("\n========== 最终结果 ==========")
-    print("全部分子分类概率文件已保存：", OUTPUT_PATH)
-    print("交叉验证指标文件已保存：", METRICS_PATH)
-
-    print("\n正样本 probability_1 统计：")
-    print(pd.Series(pos_prob_output_1).describe())
-
-    print("\n未标记样本 probability_1 统计：")
-    print(pd.Series(unl_prob_output_1).describe())
-
-    print("\n正样本平均 probability_1：", float(np.mean(pos_prob_output_1)))
-    print("未标记样本平均 probability_1：", float(np.mean(unl_prob_output_1)))
-    print("最终训练阶段概率方向被反转的比例：", float(np.mean(final_reverse_flags)))
-
-    print("\n运行总耗时：%.2f 秒" % (time.time() - start))
-
 
 if __name__ == '__main__':
     main()
